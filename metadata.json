@@ -1,0 +1,7 @@
+{
+  "name": "WebTIA - Online PLC Simulator",
+  "description": "A high-fidelity industrial automation training platform inspired by Siemens TIA Portal. Features a drag-and-drop ladder logic editor, real-time scan cycle simulation, and advanced instruction blocks like PID, Timers, and Counters.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
