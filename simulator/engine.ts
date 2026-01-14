@@ -10,7 +10,7 @@ export class PLCEngine {
 
   private timerStates: Record<string, { current: number; running: boolean; lastPowerIn: boolean | null }> = {};
   private counterStates: Record<string, { count: number; lastInput: boolean | null; lastDownInput: boolean | null }> = {};
-  private pidStates: Record<string, { integral: number; lastError: number }> = {};
+  private pidStates: Record<string, { integralSum: number; lastError: number }> = {};
   
   constructor(project: PLCProject, onUpdate: (project: PLCProject) => void) {
     this.project = project;
@@ -97,14 +97,11 @@ export class PLCEngine {
 
   private canWriteToTag(tag: Tag): boolean {
     if (tag.forced) return false;
-    // Physical inputs cannot be written by PLC logic normally, 
-    // but in simulation we allow writing to M and Q.
     if (tag.address.startsWith('I')) return false; 
     return true;
   }
 
   private scan() {
-    // Deep clone tags to ensure state detection in React
     const nextTags = this.project.tags.map(t => ({...t}));
     const tempProject = { ...this.project, tags: nextTags };
 
@@ -158,23 +155,15 @@ export class PLCEngine {
         powerOut = powerIn && !Boolean(tag?.value);
         break;
       case InstructionType.COIL:
-        if (tag && this.canWriteToTag(tag)) {
-          tag.value = powerIn;
-        }
+        if (tag && this.canWriteToTag(tag)) tag.value = powerIn;
         powerOut = powerIn;
         break;
       case InstructionType.SET:
-        // Latching logic: If powerIn is true, tag becomes TRUE and STAYS TRUE
-        if (powerIn && tag && this.canWriteToTag(tag)) {
-          tag.value = true;
-        }
+        if (powerIn && tag && this.canWriteToTag(tag)) tag.value = true;
         powerOut = powerIn;
         break;
       case InstructionType.RESET:
-        // Unlatching logic: If powerIn is true, tag becomes FALSE
-        if (powerIn && tag && this.canWriteToTag(tag)) {
-          tag.value = false;
-        }
+        if (powerIn && tag && this.canWriteToTag(tag)) tag.value = false;
         powerOut = powerIn;
         break;
       case InstructionType.TON:
@@ -193,11 +182,19 @@ export class PLCEngine {
         }
         powerOut = powerIn;
         break;
+      case InstructionType.NORM_X:
+        if (powerIn) this.handleNormX(inst, project);
+        powerOut = powerIn;
+        break;
+      case InstructionType.SCALE_X:
+        if (powerIn) this.handleScaleX(inst, project);
+        powerOut = powerIn;
+        break;
       case InstructionType.ADD:
       case InstructionType.SUB:
       case InstructionType.MUL:
       case InstructionType.DIV:
-        this.handleMath(inst, powerIn, project);
+        if (powerIn) this.handleMath(inst, project);
         powerOut = powerIn;
         break;
       case InstructionType.EQ:
@@ -208,8 +205,13 @@ export class PLCEngine {
       case InstructionType.LE:
         powerOut = powerIn && this.handleCompare(inst, project);
         break;
+      case InstructionType.AND:
+      case InstructionType.OR:
+      case InstructionType.XOR:
+        powerOut = powerIn && this.handleLogicGate(inst, project);
+        break;
       case InstructionType.PID:
-        this.handlePID(inst, powerIn, project);
+        if (powerIn) this.handlePID(inst, project);
         powerOut = powerIn;
         break;
     }
@@ -226,52 +228,46 @@ export class PLCEngine {
     return Number(tag.value);
   }
 
-  private handleTimer(inst: Instruction, powerIn: boolean, project: PLCProject): boolean {
-    const stateKey = inst.tagId || inst.id;
-    if (!this.timerStates[stateKey]) this.timerStates[stateKey] = { current: 0, running: false, lastPowerIn: powerIn };
-    const state = this.timerStates[stateKey];
-    const unitMultiplier = inst.params?.timeUnit === 's' ? 1000 : 1;
-    const preset = (inst.params?.preset || 5) * unitMultiplier;
-    let qOut = false;
+  private handleNormX(inst: Instruction, project: PLCProject) {
+    const val = this.getValue(project, inst.params?.sourceTagId, inst.params?.preset);
+    const min = this.getValue(project, inst.params?.minTagId, inst.params?.preset2 ?? 0);
+    const max = this.getValue(project, inst.params?.maxTagId, inst.params?.preset3 ?? 27648);
+    
+    let res = (max - min) !== 0 ? (val - min) / (max - min) : 0;
+    if (res < 0) res = 0; if (res > 1) res = 1;
 
-    if (inst.type === InstructionType.TON) {
-      if (powerIn) {
-        state.current += this.scanTime;
-        if (state.current >= preset) { state.current = preset; qOut = true; }
-      } else state.current = 0;
-    } else if (inst.type === InstructionType.TOF) {
-      if (powerIn) { state.current = 0; qOut = true; }
-      else {
-        state.current += this.scanTime;
-        if (state.current >= preset) { state.current = preset; qOut = false; }
-        else qOut = true;
-      }
-    }
-    if (inst.params) inst.params.current = state.current;
-    return qOut;
+    const dest = project.tags.find(t => t.id === inst.params?.destTagId);
+    if (dest && this.canWriteToTag(dest)) dest.value = Number(res.toFixed(4));
   }
 
-  private handleCounter(inst: Instruction, powerIn: boolean, project: PLCProject): boolean {
-    const stateKey = inst.tagId || inst.id;
-    if (!this.counterStates[stateKey]) this.counterStates[stateKey] = { count: 0, lastInput: powerIn, lastDownInput: false };
-    const state = this.counterStates[stateKey];
-    const resetTag = project.tags.find(t => t.id === inst.params?.resetTagId);
+  private handleScaleX(inst: Instruction, project: PLCProject) {
+    const val = this.getValue(project, inst.params?.sourceTagId, inst.params?.preset); 
+    const min = this.getValue(project, inst.params?.minTagId, inst.params?.preset2 ?? 0);
+    const max = this.getValue(project, inst.params?.maxTagId, inst.params?.preset3 ?? 100);
     
-    if (Boolean(resetTag?.value)) {
-      state.count = 0;
-    } else if (powerIn && !state.lastInput) {
-      if (inst.type === InstructionType.CTU) state.count++;
-      else if (inst.type === InstructionType.CTD) state.count--;
-    }
-    
-    state.lastInput = powerIn;
-    const qOut = state.count >= (inst.params?.preset || 0);
-    if (inst.params) inst.params.current = state.count;
-    return qOut;
+    const res = val * (max - min) + min;
+
+    const dest = project.tags.find(t => t.id === inst.params?.destTagId);
+    if (dest && this.canWriteToTag(dest)) dest.value = Number(res.toFixed(2));
   }
 
-  private handleMath(inst: Instruction, powerIn: boolean, project: PLCProject) {
-    if (!powerIn) return;
+  private handleLogicGate(inst: Instruction, project: PLCProject): boolean {
+    const v1 = Boolean(this.getValue(project, inst.params?.sourceTagId));
+    const v2 = Boolean(this.getValue(project, inst.params?.minTagId));
+    let res = false;
+    
+    // Explicit check for InstructionType.OR or OR_GATE from types
+    if (inst.type === InstructionType.AND) res = v1 && v2;
+    else if (inst.type === InstructionType.OR || (inst.type as string) === 'OR_GATE') res = v1 || v2;
+    else if (inst.type === InstructionType.XOR) res = v1 !== v2;
+
+    const dest = project.tags.find(t => t.id === inst.params?.destTagId || t.id === inst.tagId);
+    if (dest && this.canWriteToTag(dest)) dest.value = res;
+
+    return res;
+  }
+
+  private handleMath(inst: Instruction, project: PLCProject) {
     const v1 = this.getValue(project, inst.params?.sourceTagId, inst.params?.preset);
     const v2 = this.getValue(project, inst.params?.minTagId, inst.params?.preset2 ?? 0);
     let res = 0;
@@ -299,13 +295,93 @@ export class PLCEngine {
     }
   }
 
-  private handlePID(inst: Instruction, powerIn: boolean, project: PLCProject) {
-    if (!powerIn) return;
+  private handlePID(inst: Instruction, project: PLCProject) {
+    const stateKey = inst.id;
+    if (!this.pidStates[stateKey]) this.pidStates[stateKey] = { integralSum: 0, lastError: 0 };
+    const state = this.pidStates[stateKey];
+
     const sp = this.getValue(project, inst.params?.sourceTagId, inst.params?.setpoint);
-    const pv = this.getValue(project, inst.params?.minTagId);
-    const kp = inst.params?.kp || 1.0;
-    const out = (sp - pv) * kp; 
+    const pv = this.getValue(project, inst.params?.minTagId, 0);
+    
+    const kp = inst.params?.kp ?? 1.0;
+    const ki = inst.params?.ki ?? 0.1;
+    const kd = inst.params?.kd ?? 0.0;
+    
+    const error = sp - pv;
+    const dt = this.scanTime / 1000; // time in seconds
+
+    // Integration
+    state.integralSum += error * dt;
+
+    // Derivation
+    const derivative = (error - state.lastError) / dt;
+    state.lastError = error;
+
+    // Output = P + I + D
+    const out = (kp * error) + (ki * state.integralSum) + (kd * derivative);
+
     const dest = project.tags.find(t => t.id === inst.params?.destTagId);
-    if (dest && this.canWriteToTag(dest)) dest.value = Number(out.toFixed(2));
+    if (dest && this.canWriteToTag(dest)) {
+      const minOut = inst.params?.outMin ?? 0;
+      const maxOut = inst.params?.outMax ?? 100;
+      
+      let clampedOut = out;
+      if (clampedOut < minOut) clampedOut = minOut;
+      if (clampedOut > maxOut) clampedOut = maxOut;
+      
+      dest.value = Number(clampedOut.toFixed(2));
+    }
+  }
+
+  private handleTimer(inst: Instruction, powerIn: boolean, project: PLCProject): boolean {
+    const stateKey = inst.tagId || inst.id;
+    if (!this.timerStates[stateKey]) this.timerStates[stateKey] = { current: 0, running: false, lastPowerIn: powerIn };
+    const state = this.timerStates[stateKey];
+    const unitMultiplier = inst.params?.timeUnit === 's' ? 1000 : 1;
+    const preset = (inst.params?.preset || 5) * unitMultiplier;
+    let qOut = false;
+
+    if (inst.type === InstructionType.TON) {
+      if (powerIn) {
+        state.current += this.scanTime;
+        if (state.current >= preset) { state.current = preset; qOut = true; }
+      } else state.current = 0;
+    } else if (inst.type === InstructionType.TOF) {
+      if (powerIn) { state.current = 0; qOut = true; }
+      else {
+        state.current += this.scanTime;
+        if (state.current >= preset) { state.current = preset; qOut = false; }
+        else qOut = true;
+      }
+    }
+    if (inst.params) inst.params.current = state.current;
+    
+    const qTag = project.tags.find(t => t.id === inst.tagId);
+    if (qTag && this.canWriteToTag(qTag)) qTag.value = qOut;
+    
+    return qOut;
+  }
+
+  private handleCounter(inst: Instruction, powerIn: boolean, project: PLCProject): boolean {
+    const stateKey = inst.tagId || inst.id;
+    if (!this.counterStates[stateKey]) this.counterStates[stateKey] = { count: 0, lastInput: powerIn, lastDownInput: false };
+    const state = this.counterStates[stateKey];
+    const resetTag = project.tags.find(t => t.id === inst.params?.resetTagId);
+    
+    if (Boolean(resetTag?.value)) {
+      state.count = 0;
+    } else if (powerIn && !state.lastInput) {
+      if (inst.type === InstructionType.CTU) state.count++;
+      else if (inst.type === InstructionType.CTD) state.count--;
+    }
+    
+    state.lastInput = powerIn;
+    const qOut = state.count >= (inst.params?.preset || 0);
+    if (inst.params) inst.params.current = state.count;
+    
+    const qTag = project.tags.find(t => t.id === inst.tagId);
+    if (qTag && this.canWriteToTag(qTag)) qTag.value = qOut;
+    
+    return qOut;
   }
 }
