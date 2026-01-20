@@ -168,7 +168,8 @@ export class PLCEngine {
         break;
       case InstructionType.TON:
       case InstructionType.TOF:
-        powerOut = powerIn && this.handleTimer(inst, powerIn, project);
+      case InstructionType.TONR:
+        powerOut = this.handleTimer(inst, powerIn, project);
         break;
       case InstructionType.CTU:
       case InstructionType.CTD:
@@ -256,7 +257,6 @@ export class PLCEngine {
     const v2 = Boolean(this.getValue(project, inst.params?.minTagId));
     let res = false;
     
-    // Explicit check for InstructionType.OR or OR_GATE from types
     if (inst.type === InstructionType.AND) res = v1 && v2;
     else if (inst.type === InstructionType.OR || (inst.type as string) === 'OR_GATE') res = v1 || v2;
     else if (inst.type === InstructionType.XOR) res = v1 !== v2;
@@ -308,16 +308,13 @@ export class PLCEngine {
     const kd = inst.params?.kd ?? 0.0;
     
     const error = sp - pv;
-    const dt = this.scanTime / 1000; // time in seconds
+    const dt = this.scanTime / 1000; 
 
-    // Integration
     state.integralSum += error * dt;
 
-    // Derivation
     const derivative = (error - state.lastError) / dt;
     state.lastError = error;
 
-    // Output = P + I + D
     const out = (kp * error) + (ki * state.integralSum) + (kd * derivative);
 
     const dest = project.tags.find(t => t.id === inst.params?.destTagId);
@@ -334,26 +331,58 @@ export class PLCEngine {
   }
 
   private handleTimer(inst: Instruction, powerIn: boolean, project: PLCProject): boolean {
-    const stateKey = inst.tagId || inst.id;
-    if (!this.timerStates[stateKey]) this.timerStates[stateKey] = { current: 0, running: false, lastPowerIn: powerIn };
+    const stateKey = inst.id; // Use Instance ID to ensure distinct timers even with same tag
+    if (!this.timerStates[stateKey]) {
+      this.timerStates[stateKey] = { current: 0, running: false, lastPowerIn: powerIn };
+    }
     const state = this.timerStates[stateKey];
     const unitMultiplier = inst.params?.timeUnit === 's' ? 1000 : 1;
     const preset = (inst.params?.preset || 5) * unitMultiplier;
+    
+    const resetTag = project.tags.find(t => t.id === inst.params?.resetTagId);
+    const isResetTriggered = Boolean(resetTag?.value);
+
     let qOut = false;
 
     if (inst.type === InstructionType.TON) {
       if (powerIn) {
-        state.current += this.scanTime;
-        if (state.current >= preset) { state.current = preset; qOut = true; }
-      } else state.current = 0;
-    } else if (inst.type === InstructionType.TOF) {
-      if (powerIn) { state.current = 0; qOut = true; }
-      else {
-        state.current += this.scanTime;
-        if (state.current >= preset) { state.current = preset; qOut = false; }
-        else qOut = true;
+        if (state.current < preset) state.current += this.scanTime;
+        if (state.current >= preset) {
+          state.current = preset;
+          qOut = true;
+        }
+      } else {
+        state.current = 0;
+        qOut = false;
+      }
+    } 
+    else if (inst.type === InstructionType.TOF) {
+      if (powerIn) {
+        state.current = 0;
+        qOut = true;
+      } else {
+        if (state.current < preset) {
+          state.current += this.scanTime;
+          qOut = true;
+        } else {
+          state.current = preset;
+          qOut = false;
+        }
+      }
+    } 
+    else if (inst.type === InstructionType.TONR) {
+      if (isResetTriggered) {
+        state.current = 0;
+      } else if (powerIn) {
+        if (state.current < preset) state.current += this.scanTime;
+      }
+      
+      if (state.current >= preset) {
+        state.current = preset;
+        qOut = true;
       }
     }
+
     if (inst.params) inst.params.current = state.current;
     
     const qTag = project.tags.find(t => t.id === inst.tagId);
